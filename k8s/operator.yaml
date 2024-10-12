@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis-operator
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-operator
+spec:
+  selector:
+    matchLabels:
+      app: redis-operator
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: redis-operator
+    spec:
+      serviceAccountName: redis-operator
+      containers:
+      - name: operator
+        image: redis-operator:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 80
+        startupProbe:
+          httpGet:
+            path: /startup
+            port: 8080
+          initialDelaySeconds: 1
+          periodSeconds: 2
+          timeoutSeconds: 1
+          failureThreshold: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          timeoutSeconds: 1
+          periodSeconds: 2
+          failureThreshold: 3
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: redis-operator-admin
+subjects:
+- kind: ServiceAccount
+  name: redis-operator
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: redis-operator
+  apiGroup: ""
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: redis-operator
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - statefulsets
+  - services
+  - configmaps
+  - pods
+  verbs:
+  - '*'
+- apiGroups:
+  - "apps"
+  resources:
+  - statefulsets
+  - services
+  - configmaps
+  verbs:
+  - '*'
+- apiGroups:
+  - "apiextensions.k8s.io"
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - '*'
+- apiGroups:
+  - "sample.javaoperatorsdk"
+  resources:
+  - redisclusters
+  - redisclusters/status
+  verbs:
+  - '*'

@@ -1,0 +1,7 @@
+apiVersion: "sample.javaoperatorsdk/v1"
+kind: RedisCluster
+metadata:
+  name: redis-cluster
+spec:
+  version: 7.4.0
+  replicas: 4
