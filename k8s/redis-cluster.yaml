@@ -4,4 +4,4 @@ metadata:
   name: redis-cluster
 spec:
   version: 7.4.0
-  replicas: 4
+  replicas: 3

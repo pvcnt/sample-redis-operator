@@ -69,6 +69,7 @@ rules:
   - services
   - configmaps
   - pods
+  - pods/exec
   verbs:
   - '*'
 - apiGroups:
