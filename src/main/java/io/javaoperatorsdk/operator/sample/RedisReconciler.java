@@ -102,14 +102,16 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
         } else {
             if (nodes.size() < pods.size()) {
                 LOGGER.info("Scaling cluster up {} -> {}", nodes.size(), pods.size());
-                if (!scaleUp(redisCluster, nodes, pods, context)) {
+                if (!scaleUp(nodes, pods, context)) {
                     return patchStatusAndReschedule(redisCluster);
                 }
             }
+
             nodes = getNodes(context.getClient(), pods);
+
             if (nodes.stream().anyMatch(node -> node.numSlots == 0)) {
                 LOGGER.info("Rebalancing the cluster with {} nodes", pods.size());
-                if (!rebalance(redisCluster, pods, context)) {
+                if (!rebalance(pods, context)) {
                     return patchStatusAndReschedule(redisCluster);
                 }
             }
@@ -127,9 +129,6 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
         var res = exec(context.getClient(), pods.get(0), args);
         if (res.exitCode() == 0) {
             LOGGER.info("Created a cluster with {} nodes", pods.size());
-            redisCluster.getStatus().setKnownNodes(redisCluster.getSpec().getReplicas());
-            redisCluster.getStatus().setUsedNodes(redisCluster.getSpec().getReplicas());
-
             return true;
         } else {
             LOGGER.error("Could not create cluster [{}]: {}", res.exitCode(), res.out());
@@ -137,14 +136,13 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
         }
     }
 
-    private boolean scaleUp(RedisCluster redisCluster, List<Node> nodes, List<Pod> pods, Context<RedisCluster> context) {
-        for (int i = redisCluster.getStatus().getKnownNodes(); i < pods.size(); i++) {
+    private boolean scaleUp(List<Node> nodes, List<Pod> pods, Context<RedisCluster> context) {
+        for (int i = nodes.size(); i < pods.size(); i++) {
             var pod = pods.get(i);
             var args = List.of("redis-cli", "--cluster-yes", "--cluster", "add-node", getHostAndPort(pod), getHostAndPort(pods.get(0)));
             var res = exec(context.getClient(), pods.get(0), args);
             if (res.exitCode() == 0) {
                 LOGGER.info("Added node {} to the cluster", pod.getMetadata().getName());
-                redisCluster.getStatus().incrementKnownNodes();
             } else {
                 LOGGER.error("Could not add node {} to the cluster [{}]: {}", pod.getMetadata().getName(), res.exitCode(), res.out());
                 fixCluster(context.getClient(), pods);
@@ -154,12 +152,11 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
         return true;
     }
 
-    private boolean rebalance(RedisCluster redisCluster, List<Pod> pods, Context<RedisCluster> context) {
+    private boolean rebalance(List<Pod> pods, Context<RedisCluster> context) {
         var args = List.of("redis-cli", "--cluster-yes", "--cluster", "rebalance", getHostAndPort(pods.get(0)), "--cluster-use-empty-masters");
         var stopWatch = Stopwatch.createStarted();
         var res = exec(context.getClient(), pods.get(0), args);
         if (res.exitCode() == 0) {
-            redisCluster.getStatus().setUsedNodes(redisCluster.getStatus().getKnownNodes());
             LOGGER.info("Rebalanced the cluster with {} nodes in {}", pods.size(), stopWatch);
             return true;
         } else {
@@ -195,7 +192,6 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
                 var stopWatch = Stopwatch.createStarted();
                 var res = exec(context.getClient(), pods.get(0), args);
                 if (res.exitCode() == 0) {
-                    redisCluster.getStatus().decrementUsedNodes();
                     LOGGER.info("Resharded cluster from {} to {} in {}", node.nodeId, targetNode.nodeId, stopWatch);
                 } else {
                     LOGGER.error("Could not reshard cluster from {} to {} [{}]: {}", node.nodeId, targetNode.nodeId, res.exitCode(), res.out());
@@ -208,7 +204,6 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
             var stopWatch = Stopwatch.createStarted();
             var res = exec(context.getClient(), pods.get(0), args);
             if (res.exitCode() == 0) {
-                redisCluster.getStatus().decrementKnownNodes();
                 LOGGER.info("Removed node {} from the cluster in {}", node.nodeId, stopWatch);
             } else {
                 LOGGER.error("Could not remove node {} from the cluster [{}]: {}", node.nodeId, res.exitCode(), res.out());
