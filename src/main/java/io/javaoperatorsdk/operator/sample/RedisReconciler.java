@@ -31,7 +31,7 @@ import static io.javaoperatorsdk.operator.sample.dependentresource.StatefulSetDe
 @ControllerConfiguration
 public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceInitializer<RedisCluster> {
     private static final Logger LOGGER = LoggerFactory.getLogger(RedisReconciler.class);
-    private static final Duration RESCHEDULE_AFTER = Duration.ofSeconds(30);
+    private static final Duration RESCHEDULE_AFTER = Duration.ofSeconds(15);
     private static final String POD_INDEX_LABEL = "apps.kubernetes.io/pod-index";
     public static final String MANAGED_LABEL = "redis-operator.io/managed";
 
@@ -47,138 +47,171 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
     @Override
     public UpdateControl<RedisCluster> reconcile(RedisCluster redisCluster, Context<RedisCluster> context) {
         if (null == redisCluster.getStatus()) {
+            // status is null by default. Initialize it so that it can be manipulated later.
+            // It is also required for automatic observed generation handling.
+            // https://javaoperatorsdk.io/docs/features/#automatic-observed-generation-handling
             redisCluster.setStatus(new RedisClusterStatus());
         }
 
+        // 1/ We verify whether we need to scale down the cluster. This must be done
+        // before the StatefulSet is reconciled, to ensure that we do not lose any
+        // data stored in a cluster node.
         var maybeSts = context.getSecondaryResource(StatefulSet.class);
-        if (maybeSts.isPresent() && isStable(maybeSts.get())) {
-            if (redisCluster.getStatus().getKnownNodes() != null && redisCluster.getStatus().getKnownNodes() > redisCluster.getSpec().getReplicas()) {
-                if (!scaleDown(redisCluster, maybeSts.get(), context)) {
+        if (maybeSts.isPresent()) {
+            var pods = getPods(maybeSts.get(), context);
+            var nodes = getNodes(context.getClient(), pods);
+            if (nodes.size() > redisCluster.getSpec().getReplicas()) {
+                LOGGER.info("Scaling cluster down {} -> {}", nodes.size(), redisCluster.getSpec().getReplicas());
+                if (!pods.stream().allMatch(RedisReconciler::isHealthy)) {
+                    LOGGER.info("Pods are not healthy, skipping");
+                    return UpdateControl.patchStatus(redisCluster);
+                }
+                if (!scaleDown(redisCluster, nodes, pods, context)) {
                     LOGGER.error("Error while scaling down, rescheduling");
-                    return UpdateControl.patchStatus(redisCluster).rescheduleAfter(RESCHEDULE_AFTER);
+                    return patchStatusAndReschedule(redisCluster);
                 }
             }
         }
 
+        // 2/ Propagate any updates made to a RedisCluster to dependent resources.
         configMapDR.reconcile(redisCluster, context);
         statefulSetDR.reconcile(redisCluster, context);
         serviceDR.reconcile(redisCluster, context);
 
+        // 3/ Retrieve the StatefulSet that was created or updated, all the pods and
+        // nodes that form the cluster.
         var sts = context.getSecondaryResource(StatefulSet.class).orElseThrow();
-
-        if (isStable(redisCluster, sts)) {
-            if (redisCluster.getStatus().getKnownNodes() == null || redisCluster.getStatus().getKnownNodes() == 0) {
-                return createCluster(redisCluster, sts, context);
-            } else if (redisCluster.getStatus().getUsedNodes() == null || redisCluster.getStatus().getUsedNodes() < redisCluster.getSpec().getReplicas()) {
-                return scaleUp(redisCluster, sts, context);
+        var pods = getPods(sts, context);
+        redisCluster.getStatus().setReplicas(pods.size());
+        if (pods.size() != sts.getStatus().getReplicas()) {
+            // This is a race condition.
+            LOGGER.warn("Pods do not match expected replicas (got {}, expected {})", pods.size(), sts.getStatus().getReplicas());
+            return patchStatusAndReschedule(redisCluster);
+        }
+        if (!pods.stream().allMatch(RedisReconciler::isHealthy)) {
+            LOGGER.info("Pods are not healthy, skipping");
+            return UpdateControl.patchStatus(redisCluster);
+        }
+        var nodes = getNodes(context.getClient(), pods);
+        if (nodes.size() == 1) {
+            // A Redis cluster needs a minimum of three nodes. If we have a single node,
+            // it means it is a newly created cluster.
+            if (!createCluster(redisCluster, pods, context)) {
+                return patchStatusAndReschedule(redisCluster);
+            }
+        } else {
+            if (nodes.size() < pods.size()) {
+                LOGGER.info("Scaling cluster up {} -> {}", nodes.size(), pods.size());
+                if (!scaleUp(redisCluster, nodes, pods, context)) {
+                    return patchStatusAndReschedule(redisCluster);
+                }
+            }
+            nodes = getNodes(context.getClient(), pods);
+            if (nodes.stream().anyMatch(node -> node.numSlots == 0)) {
+                LOGGER.info("Rebalancing the cluster with {} nodes", pods.size());
+                if (!rebalance(redisCluster, pods, context)) {
+                    return patchStatusAndReschedule(redisCluster);
+                }
             }
         }
+        // Everything went well, we simply patch the status.
         return UpdateControl.patchStatus(redisCluster);
     }
 
-    private UpdateControl<RedisCluster> createCluster(RedisCluster redisCluster, StatefulSet sts, Context<RedisCluster> context) {
-        LOGGER.info("Creating a new cluster with {} nodes", sts.getStatus().getReplicas());
+    private boolean createCluster(RedisCluster redisCluster, List<Pod> pods, Context<RedisCluster> context) {
+        LOGGER.info("Creating a new cluster with {} nodes", pods.size());
 
-        var pods = getPods(sts, context);
-        var args = new ArrayList<>(List.of("redis-cli", "--cluster", "create"));
+        var args = new ArrayList<>(List.of("redis-cli", "--cluster-yes", "--cluster", "create"));
         pods.forEach(pod -> args.add(pod.getStatus().getPodIP() + ":" + ConfigMapDependentResource.PORT));
-        args.add("--cluster-yes");
 
         var res = exec(context.getClient(), pods.get(0), args);
         if (res.exitCode() == 0) {
-            LOGGER.info("Created a cluster with {} nodes", sts.getStatus().getReplicas());
+            LOGGER.info("Created a cluster with {} nodes", pods.size());
             redisCluster.getStatus().setKnownNodes(redisCluster.getSpec().getReplicas());
             redisCluster.getStatus().setUsedNodes(redisCluster.getSpec().getReplicas());
 
-            return UpdateControl.patchStatus(redisCluster);
+            return true;
         } else {
             LOGGER.error("Could not create cluster [{}]: {}", res.exitCode(), res.out());
-            return UpdateControl.<RedisCluster>noUpdate().rescheduleAfter(RESCHEDULE_AFTER);
+            return false;
         }
     }
 
-    private UpdateControl<RedisCluster> scaleUp(RedisCluster redisCluster, StatefulSet sts, Context<RedisCluster> context) {
-        return scaleUp(redisCluster, sts, context, true);
-    }
-
-    private UpdateControl<RedisCluster> scaleUp(RedisCluster redisCluster, StatefulSet sts, Context<RedisCluster> context, boolean tryFix) {
-        LOGGER.info("Scaling cluster up {} -> {}", redisCluster.getStatus().getUsedNodes(), redisCluster.getSpec().getReplicas());
-
-        var pods = getPods(sts, context);
-        for (int i = redisCluster.getStatus().getKnownNodes(); i < sts.getStatus().getReplicas(); i++) {
+    private boolean scaleUp(RedisCluster redisCluster, List<Node> nodes, List<Pod> pods, Context<RedisCluster> context) {
+        for (int i = redisCluster.getStatus().getKnownNodes(); i < pods.size(); i++) {
             var pod = pods.get(i);
-            var args = List.of("redis-cli", "--cluster", "add-node", getHostAndPort(pod), getHostAndPort(pods.get(0)), "--cluster-yes");
+            var args = List.of("redis-cli", "--cluster-yes", "--cluster", "add-node", getHostAndPort(pod), getHostAndPort(pods.get(0)));
             var res = exec(context.getClient(), pods.get(0), args);
             if (res.exitCode() == 0) {
                 LOGGER.info("Added node {} to the cluster", pod.getMetadata().getName());
                 redisCluster.getStatus().incrementKnownNodes();
             } else {
                 LOGGER.error("Could not add node {} to the cluster [{}]: {}", pod.getMetadata().getName(), res.exitCode(), res.out());
-                return UpdateControl.patchStatus(redisCluster).rescheduleAfter(RESCHEDULE_AFTER);
+                fixCluster(context.getClient(), pods);
+                return false;
             }
         }
+        return true;
+    }
 
-        var args = List.of("redis-cli", "--cluster", "rebalance", getHostAndPort(pods.get(0)), "--cluster-use-empty-masters", "--cluster-yes");
+    private boolean rebalance(RedisCluster redisCluster, List<Pod> pods, Context<RedisCluster> context) {
+        var args = List.of("redis-cli", "--cluster-yes", "--cluster", "rebalance", getHostAndPort(pods.get(0)), "--cluster-use-empty-masters");
+        var stopWatch = Stopwatch.createStarted();
         var res = exec(context.getClient(), pods.get(0), args);
         if (res.exitCode() == 0) {
             redisCluster.getStatus().setUsedNodes(redisCluster.getStatus().getKnownNodes());
-            LOGGER.info("Scaled the cluster to {} nodes", sts.getStatus().getReplicas());
-            return UpdateControl.patchStatus(redisCluster);
-        } else {
-            LOGGER.error("Could not rebalance cluster [{}]: {}", res.exitCode(), res.out());
-            if (tryFix && fixCluster(context.getClient(), pods.get(0))) {
-                return scaleUp(redisCluster, sts, context, false);
-            }
-            return UpdateControl.patchStatus(redisCluster).rescheduleAfter(RESCHEDULE_AFTER);
-        }
-    }
-
-    private boolean fixCluster(KubernetesClient client, Pod pod) {
-        var args = List.of("redis-cli", "--cluster", "fix", getHostAndPort(pod));
-        var res = exec(client, pod, args);
-        if (res.exitCode() == 0) {
-            LOGGER.info("Fixed the cluster");
+            LOGGER.info("Rebalanced the cluster with {} nodes in {}", pods.size(), stopWatch);
             return true;
         } else {
-            LOGGER.error("Could not fix the cluster [{}]: {}", res.exitCode(), res.out());
+            LOGGER.error("Could not rebalance cluster [{}]: {}", res.exitCode(), res.out());
+            fixCluster(context.getClient(), pods);
             return false;
         }
     }
 
-    private boolean scaleDown(RedisCluster redisCluster, StatefulSet sts, Context<RedisCluster> context) {
-        LOGGER.info("Scaling cluster down {} -> {}", redisCluster.getStatus().getKnownNodes(), redisCluster.getSpec().getReplicas());
+    private void fixCluster(KubernetesClient client, List<Pod> pods) {
+        LOGGER.info("Fixing the cluster with {} nodes", pods.size());
+        var args = List.of("redis-cli", "--cluster-yes", "--cluster", "fix", getHostAndPort(pods.get(0)));
+        var stopWatch = Stopwatch.createStarted();
+        var res = exec(client, pods.get(0), args);
+        if (res.exitCode() == 0) {
+            LOGGER.info("Fixed the cluster with {} nodes in {}", pods.size(), stopWatch);
+        } else {
+            LOGGER.error("Could not fix the cluster [{}]: {}", res.exitCode(), res.out());
+        }
+    }
 
-        var pods = getPods(sts, context);
-        var nodes = getNodes(context.getClient(), pods);
-        assert pods.size() == nodes.size();
-        for (int i = redisCluster.getSpec().getReplicas(); i < redisCluster.getStatus().getKnownNodes(); i++) {
-            var pod = pods.get(i);
+    private boolean scaleDown(RedisCluster redisCluster, List<Node> nodes, List<Pod> pods, Context<RedisCluster> context) {
+        for (int i = redisCluster.getSpec().getReplicas(); i < nodes.size(); i++) {
             var node = nodes.get(i);
-
             if (node.numSlots > 0) {
                 var targetNode = nodes.get(i % redisCluster.getSpec().getReplicas());
-                var args = List.of("redis-cli", "--cluster", "reshard", getHostAndPort(pods.get(0)),
+                LOGGER.info("Resharding cluster from {} to {}", node.nodeId, targetNode.nodeId);
+                var args = List.of("redis-cli", "--cluster-yes",
+                        "--cluster", "reshard", getHostAndPort(pods.get(0)),
                         "--cluster-from", node.nodeId,
                         "--cluster-to", targetNode.nodeId,
-                        "--cluster-slots", String.valueOf(node.numSlots),
-                        "--cluster-yes");
+                        "--cluster-slots", String.valueOf(node.numSlots));
+                var stopWatch = Stopwatch.createStarted();
                 var res = exec(context.getClient(), pods.get(0), args);
                 if (res.exitCode() == 0) {
                     redisCluster.getStatus().decrementUsedNodes();
-                    LOGGER.info("Resharded cluster from {} to {}", node.nodeId, targetNode.nodeId);
+                    LOGGER.info("Resharded cluster from {} to {} in {}", node.nodeId, targetNode.nodeId, stopWatch);
                 } else {
                     LOGGER.error("Could not reshard cluster from {} to {} [{}]: {}", node.nodeId, targetNode.nodeId, res.exitCode(), res.out());
                     return false;
                 }
             }
 
-            var args = List.of("redis-cli", "--cluster", "del-node", getHostAndPort(pods.get(0)), node.nodeId(), "--cluster-yes");
+            LOGGER.info("Removing node {} from the cluster", node.nodeId);
+            var args = List.of("redis-cli", "--cluster-yes", "--cluster", "del-node", getHostAndPort(pods.get(0)), node.nodeId());
+            var stopWatch = Stopwatch.createStarted();
             var res = exec(context.getClient(), pods.get(0), args);
             if (res.exitCode() == 0) {
                 redisCluster.getStatus().decrementKnownNodes();
-                LOGGER.info("Removed node {} from the cluster", pod.getMetadata().getName());
+                LOGGER.info("Removed node {} from the cluster in {}", node.nodeId, stopWatch);
             } else {
-                LOGGER.error("Could not remove node {} from the cluster [{}]: {}", pod.getMetadata().getName(), res.exitCode(), res.out());
+                LOGGER.error("Could not remove node {} from the cluster [{}]: {}", node.nodeId, res.exitCode(), res.out());
                 return false;
             }
         }
@@ -212,14 +245,10 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
                 .anyMatch(ref -> ref.getController() && ref.getUid().equals(sts.getMetadata().getUid()));
     }
 
-    private static boolean isStable(RedisCluster redisCluster, StatefulSet sts) {
-        return isStable(sts) && Objects.equals(redisCluster.getSpec().getReplicas(), sts.getStatus().getAvailableReplicas());
-    }
-
-    private static boolean isStable(StatefulSet sts) {
-        return sts.getStatus() != null
-                && Objects.equals(sts.getMetadata().getGeneration(), sts.getStatus().getObservedGeneration())
-                && Objects.equals(sts.getSpec().getReplicas(), sts.getStatus().getAvailableReplicas());
+    private static boolean isHealthy(Pod pod) {
+        return pod.getStatus() != null
+                && pod.getStatus().getConditions().stream().anyMatch(c -> "Ready".equals(c.getType()) && "True".equals(c.getStatus()))
+                && pod.getMetadata().getDeletionTimestamp() == null;
     }
 
     private record ExecResult(int exitCode, String out) {
@@ -265,6 +294,8 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
     }
 
     private Node parseNode(String line) {
+        // https://redis.io/docs/latest/commands/cluster-nodes/
+        // <id> <ip:port@cport[,hostname]> <flags> <master> <ping-sent> <pong-recv> <config-epoch> <link-state> <slot> <slot> ... <slot>
         // 5592b02ba4a6ec5e22e65c01235b4df40603022b 10.1.1.32:6379@16379 master - 0 1728848005049 7 connected 10381-10766 13654-14043
         String[] parts = line.split(" ");
         String hostAndPort = parts[1].split("@")[0];
@@ -274,5 +305,9 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
             numSlots += Integer.parseInt(slotsRange[1]) - Integer.parseInt(slotsRange[0]) + 1;
         }
         return new Node(parts[0], hostAndPort, numSlots);
+    }
+
+    private UpdateControl<RedisCluster> patchStatusAndReschedule(RedisCluster redisCluster) {
+        return UpdateControl.patchStatus(redisCluster).rescheduleAfter(RESCHEDULE_AFTER);
     }
 }
