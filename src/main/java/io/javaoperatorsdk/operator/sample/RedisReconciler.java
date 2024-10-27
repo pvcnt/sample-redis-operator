@@ -63,6 +63,7 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
             if (nodes.size() > redisCluster.getSpec().getReplicas()) {
                 LOGGER.info("Scaling cluster down {} -> {}", nodes.size(), redisCluster.getSpec().getReplicas());
                 if (!pods.stream().allMatch(RedisReconciler::isHealthy)) {
+                    // A pod has crashed, or the StatefulSet is being updated.
                     LOGGER.info("Pods are not healthy, skipping");
                     return UpdateControl.patchStatus(redisCluster);
                 }
@@ -83,12 +84,8 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
         var sts = context.getSecondaryResource(StatefulSet.class).orElseThrow();
         var pods = getPods(sts, context);
         redisCluster.getStatus().setReplicas(pods.size());
-        if (pods.size() != sts.getStatus().getReplicas()) {
-            // This is a race condition.
-            LOGGER.warn("Pods do not match expected replicas (got {}, expected {})", pods.size(), sts.getStatus().getReplicas());
-            return patchStatusAndReschedule(redisCluster);
-        }
         if (!pods.stream().allMatch(RedisReconciler::isHealthy)) {
+            // A pod has crashed, or the StatefulSet is being updated.
             LOGGER.info("Pods are not healthy, skipping");
             return UpdateControl.patchStatus(redisCluster);
         }
@@ -96,20 +93,24 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
         if (nodes.size() == 1) {
             // A Redis cluster needs a minimum of three nodes. If we have a single node,
             // it means it is a newly created cluster.
-            if (!createCluster(redisCluster, pods, context)) {
+            LOGGER.info("Creating a new cluster with {} nodes", pods.size());
+            if (!createCluster(pods, context)) {
                 return patchStatusAndReschedule(redisCluster);
             }
         } else {
+            // This is an existing redis cluster.
             if (nodes.size() < pods.size()) {
                 LOGGER.info("Scaling cluster up {} -> {}", nodes.size(), pods.size());
                 if (!scaleUp(nodes, pods, context)) {
                     return patchStatusAndReschedule(redisCluster);
                 }
+                // We have scaled up, retrieve again nodes since they have changed.
+                nodes = getNodes(context.getClient(), pods);
             }
-
-            nodes = getNodes(context.getClient(), pods);
-
             if (nodes.stream().anyMatch(node -> node.numSlots == 0)) {
+                // We only rebalance the cluster if at least one node has no slots assigned to it.
+                // In a more elaborate strategy, we could rebalance if we detect the partition
+                // is not balanced across all nodes.
                 LOGGER.info("Rebalancing the cluster with {} nodes", pods.size());
                 if (!rebalance(pods, context)) {
                     return patchStatusAndReschedule(redisCluster);
@@ -120,12 +121,9 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
         return UpdateControl.patchStatus(redisCluster);
     }
 
-    private boolean createCluster(RedisCluster redisCluster, List<Pod> pods, Context<RedisCluster> context) {
-        LOGGER.info("Creating a new cluster with {} nodes", pods.size());
-
+    private boolean createCluster(List<Pod> pods, Context<RedisCluster> context) {
         var args = new ArrayList<>(List.of("redis-cli", "--cluster-yes", "--cluster", "create"));
         pods.forEach(pod -> args.add(pod.getStatus().getPodIP() + ":" + ConfigMapDependentResource.PORT));
-
         var res = exec(context.getClient(), pods.get(0), args);
         if (res.exitCode() == 0) {
             LOGGER.info("Created a cluster with {} nodes", pods.size());
