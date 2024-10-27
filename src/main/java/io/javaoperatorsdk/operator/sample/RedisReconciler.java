@@ -154,10 +154,9 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
 
     private boolean rebalance(List<Pod> pods, Context<RedisCluster> context) {
         var args = List.of("redis-cli", "--cluster-yes", "--cluster", "rebalance", getHostAndPort(pods.get(0)), "--cluster-use-empty-masters");
-        var stopWatch = Stopwatch.createStarted();
         var res = exec(context.getClient(), pods.get(0), args);
         if (res.exitCode() == 0) {
-            LOGGER.info("Rebalanced the cluster with {} nodes in {}", pods.size(), stopWatch);
+            LOGGER.info("Rebalanced the cluster with {} nodes", pods.size());
             return true;
         } else {
             LOGGER.error("Could not rebalance cluster [{}]: {}", res.exitCode(), res.out());
@@ -169,10 +168,9 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
     private void fixCluster(KubernetesClient client, List<Pod> pods) {
         LOGGER.info("Fixing the cluster with {} nodes", pods.size());
         var args = List.of("redis-cli", "--cluster-yes", "--cluster", "fix", getHostAndPort(pods.get(0)));
-        var stopWatch = Stopwatch.createStarted();
         var res = exec(client, pods.get(0), args);
         if (res.exitCode() == 0) {
-            LOGGER.info("Fixed the cluster with {} nodes in {}", pods.size(), stopWatch);
+            LOGGER.info("Fixed the cluster with {} nodes", pods.size());
         } else {
             LOGGER.error("Could not fix the cluster [{}]: {}", res.exitCode(), res.out());
         }
@@ -189,10 +187,9 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
                         "--cluster-from", node.nodeId,
                         "--cluster-to", targetNode.nodeId,
                         "--cluster-slots", String.valueOf(node.numSlots));
-                var stopWatch = Stopwatch.createStarted();
                 var res = exec(context.getClient(), pods.get(0), args);
                 if (res.exitCode() == 0) {
-                    LOGGER.info("Resharded cluster from {} to {} in {}", node.nodeId, targetNode.nodeId, stopWatch);
+                    LOGGER.info("Resharded cluster from {} to {}", node.nodeId, targetNode.nodeId);
                 } else {
                     LOGGER.error("Could not reshard cluster from {} to {} [{}]: {}", node.nodeId, targetNode.nodeId, res.exitCode(), res.out());
                     return false;
@@ -201,10 +198,9 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
 
             LOGGER.info("Removing node {} from the cluster", node.nodeId);
             var args = List.of("redis-cli", "--cluster-yes", "--cluster", "del-node", getHostAndPort(pods.get(0)), node.nodeId());
-            var stopWatch = Stopwatch.createStarted();
             var res = exec(context.getClient(), pods.get(0), args);
             if (res.exitCode() == 0) {
-                LOGGER.info("Removed node {} from the cluster in {}", node.nodeId, stopWatch);
+                LOGGER.info("Removed node {} from the cluster", node.nodeId);
             } else {
                 LOGGER.error("Could not remove node {} from the cluster [{}]: {}", node.nodeId, res.exitCode(), res.out());
                 return false;
@@ -250,7 +246,7 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
     }
 
     private static ExecResult exec(KubernetesClient client, Pod pod, List<String> args) {
-        var stopwatch = Stopwatch.createStarted();
+        var stopWatch = Stopwatch.createStarted();
         var baos = new ByteArrayOutputStream();
         try (var watch = client.pods()
                 .resource(pod)
@@ -259,7 +255,7 @@ public class RedisReconciler implements Reconciler<RedisCluster>, EventSourceIni
                 .writingError(baos)
                 .exec(args.toArray(new String[0]))) {
             int exitCode = watch.exitCode().get(2, TimeUnit.MINUTES);
-            LOGGER.info("Executed [{}] on {} in {}", String.join(" ", args), pod.getMetadata().getName(), stopwatch);
+            LOGGER.info("Executed [{}] on {} in {}", String.join(" ", args), pod.getMetadata().getName(), stopWatch);
             return new ExecResult(exitCode, baos.toString());
         } catch (ExecutionException | InterruptedException | TimeoutException e) {
             LOGGER.error("Error while executing [{}] on {}", String.join(" ", args), pod.getMetadata().getName(), e);
